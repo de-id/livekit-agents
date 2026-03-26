@@ -17,7 +17,6 @@ from livekit.agents import (
 from .errors import DIDException
 from .log import logger
 
-
 DEFAULT_API_URL = "https://api.d-id.com"
 
 
@@ -30,16 +29,12 @@ class DIDAPI:
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
-        did_api_key = (
-            api_key if utils.is_given(api_key) else os.getenv("DID_API_KEY")
-        )
+        did_api_key = api_key if utils.is_given(api_key) else os.getenv("DID_API_KEY")
         if not did_api_key:
             raise DIDException("DID_API_KEY must be set")
         self._api_key = did_api_key
 
-        self._api_url = (
-            api_url if utils.is_given(api_url) else DEFAULT_API_URL
-        )
+        self._api_url = api_url if utils.is_given(api_url) else DEFAULT_API_URL
         self._conn_options = conn_options
         self._session = session or aiohttp.ClientSession()
 
@@ -58,9 +53,7 @@ class DIDAPI:
             "transport": transport,
             "audio_config": audio_config,
         }
-        response_data = await self._post(
-            f"v2/agents/{agent_id}/sessions/join", payload
-        )
+        response_data = await self._post(f"v2/agents/{agent_id}/sessions/join", payload)
         return response_data["id"]
 
     async def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -74,9 +67,7 @@ class DIDAPI:
                         "Authorization": f"Basic {self._api_key}",
                     },
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(
-                        sock_connect=self._conn_options.timeout
-                    ),
+                    timeout=aiohttp.ClientTimeout(sock_connect=self._conn_options.timeout),
                 ) as response:
                     if not response.ok:
                         text = await response.text()
@@ -94,9 +85,7 @@ class DIDAPI:
                     extra={"error": str(e)},
                 )
                 if attempt >= self._conn_options.max_retry - 1:
-                    raise APIConnectionError(
-                        f"Failed to connect to D-ID API at {url}"
-                    ) from e
+                    raise APIConnectionError(f"Failed to connect to D-ID API at {url}") from e
                 await asyncio.sleep(self._conn_options.retry_interval)
 
         raise APIConnectionError(f"Failed to connect to D-ID API at {url}")

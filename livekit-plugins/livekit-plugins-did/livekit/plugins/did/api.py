@@ -54,7 +54,7 @@ class DIDAPI:
             "audio_config": audio_config,
         }
         response_data = await self._post(f"v2/agents/{agent_id}/sessions/join", payload)
-        return response_data["id"]
+        return response_data["id"]  # type: ignore
 
     async def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self._api_url}/{endpoint}"
@@ -76,7 +76,7 @@ class DIDAPI:
                             status_code=response.status,
                             body=text,
                         )
-                    return await response.json()
+                    return await response.json()  # type: ignore
             except APIStatusError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:

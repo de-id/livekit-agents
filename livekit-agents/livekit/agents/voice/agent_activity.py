@@ -18,8 +18,6 @@ from livekit.agents.metrics.base import Metadata
 from .. import inference, llm, stt, tts, utils, vad
 from ..llm.chat_context import Instructions
 from ..llm.tool_context import (
-    FunctionToolInfo,
-    RawFunctionToolInfo,
     StopResponse,
     ToolFlag,
     get_fnc_tool_names,
@@ -969,6 +967,7 @@ class AgentActivity(RecognitionHooks):
         chat_ctx: NotGivenOr[llm.ChatContext | None] = NOT_GIVEN,
         instructions: NotGivenOr[str | Instructions] = NOT_GIVEN,
         tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
+        tools: NotGivenOr[list[str]] = NOT_GIVEN,
         allow_interruptions: NotGivenOr[bool] = NOT_GIVEN,
         schedule_speech: bool = True,
         input_details: InputDetails = DEFAULT_INPUT_DETAILS,
@@ -994,24 +993,39 @@ class AgentActivity(RecognitionHooks):
                     # when generate_reply is called inside a function_tool, set tool_choice to None by default  # noqa: E501
                     tool_choice = "none"
 
-        tools = self.tools
+        all_tools = self.tools.copy()
+
+        # resolve tool names to Tool objects if tools param is given
+        resolved_tools: NotGivenOr[list[llm.Tool | llm.Toolset]] = NOT_GIVEN
+        if is_given(tools):
+            tool_ctx = llm.ToolContext(all_tools)
+            toolset_dict = {t.id: t for t in tool_ctx.toolsets}
+            tool_dict = {t.id: t for t in tool_ctx.flatten()}
+            resolved_tools = list[llm.Tool | llm.Toolset]()
+            for name in set(tools):
+                tool = toolset_dict.get(name) or tool_dict.get(name)
+                if tool is None:
+                    raise ValueError(
+                        f"tool '{name}' not found in agent's registered tools. "
+                        f"Available tools: {list(tool_ctx.function_tools.keys())}"
+                    )
+                resolved_tools.append(tool)
 
         # if tool has the IGNORE_ON_ENTER flag, every generate_reply inside on_enter will ignore it
         if on_enter_data := _OnEnterContextVar.get(None):
             if on_enter_data.agent == self._agent and on_enter_data.session == self._session:
                 filtered_tools: list[llm.Tool | llm.Toolset] = []
-                for tool in tools:
-                    info: RawFunctionToolInfo | FunctionToolInfo | None = None
-                    if isinstance(tool, llm.RawFunctionTool | llm.FunctionTool):
-                        info = tool.info
-
-                    if info and (info.flags & ToolFlag.IGNORE_ON_ENTER):
+                to_filter = resolved_tools if is_given(resolved_tools) else all_tools
+                for tool in to_filter:
+                    if (
+                        isinstance(tool, llm.RawFunctionTool | llm.FunctionTool)
+                        and tool.info.flags & ToolFlag.IGNORE_ON_ENTER
+                    ):
                         continue
 
                     # TODO(long): add IGNORE_ON_ENTER to ToolSet?
                     filtered_tools.append(tool)
-
-                tools = filtered_tools
+                to_filter[:] = filtered_tools
 
         handle = SpeechHandle.create(
             allow_interruptions=allow_interruptions
@@ -1031,7 +1045,7 @@ class AgentActivity(RecognitionHooks):
                     # TODO(theomonnom): support llm.ChatMessage for the realtime model
                     user_input=user_message.text_content if user_message else None,
                     instructions=instructions or None,
-                    # TODO(theomonnom): the list of tools should always be passed here
+                    tools=resolved_tools if is_given(resolved_tools) else None,
                     model_settings=ModelSettings(tool_choice=tool_choice),
                 ),
                 speech_handle=handle,
@@ -1043,7 +1057,7 @@ class AgentActivity(RecognitionHooks):
                 self._pipeline_reply_task(
                     speech_handle=handle,
                     chat_ctx=chat_ctx or self._agent._chat_ctx,
-                    tools=tools,
+                    tools=resolved_tools if is_given(resolved_tools) else all_tools,
                     new_message=user_message if is_given(user_message) else None,
                     instructions=instructions or None,
                     model_settings=ModelSettings(
@@ -2003,7 +2017,9 @@ class AgentActivity(RecognitionHooks):
             text_source = _read_text()
             audio_source = _read_text()
 
-        tasks: list[asyncio.Task[Any]] = []
+        tts_task: asyncio.Task[Any] | None = None
+        forward_audio_task: asyncio.Task[Any] | None = None
+        forward_text_task: asyncio.Task[Any] | None = None
         started_speaking_at: float | None = None
         stopped_speaking_at: float | None = None
 
@@ -2042,7 +2058,6 @@ class AgentActivity(RecognitionHooks):
                     model=self.tts.model if self.tts else None,
                     provider=self.tts.provider if self.tts else None,
                 )
-                tasks.append(tts_task)
                 if (
                     self.use_tts_aligned_transcript
                     and (tts := self.tts)
@@ -2051,16 +2066,14 @@ class AgentActivity(RecognitionHooks):
                 ):
                     text_source = timed_texts
 
-                forward_task, audio_out = perform_audio_forwarding(
+                forward_audio_task, audio_out = perform_audio_forwarding(
                     audio_output=audio_output, tts_output=tts_gen_data.audio_ch
                 )
-                tasks.append(forward_task)
             else:
                 # use the provided audio
-                forward_task, audio_out = perform_audio_forwarding(
+                forward_audio_task, audio_out = perform_audio_forwarding(
                     audio_output=audio_output, tts_output=audio
                 )
-                tasks.append(forward_task)
 
             audio_out.first_frame_fut.add_done_callback(_on_first_frame)
 
@@ -2069,16 +2082,24 @@ class AgentActivity(RecognitionHooks):
         tr_node_result = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
         text_out: _TextOutput | None = None
         if tr_node_result is not None:
-            forward_text, text_out = perform_text_forwarding(
+            forward_text_task, text_out = perform_text_forwarding(
                 text_output=tr_output,
                 source=tr_node_result,
             )
-            tasks.append(forward_text)
             if audio_output is None:
                 # update the agent state based on text if no audio output
                 text_out.first_text_fut.add_done_callback(_on_first_frame)
 
-        await speech_handle.wait_if_not_interrupted([*tasks])
+        all_tasks: list[asyncio.Future[Any]] = [
+            t for t in (tts_task, forward_audio_task, forward_text_task) if t is not None
+        ]
+        await speech_handle.wait_if_not_interrupted(all_tasks)
+
+        # check for errors in generation/forwarding tasks (e.g. missing audio file)
+        for task in (tts_task, forward_audio_task, forward_text_task):
+            if task is not None and task.done() and not task.cancelled():
+                if exc := task.exception():
+                    raise exc
 
         if audio_output is not None:
             await speech_handle.wait_if_not_interrupted(
@@ -2088,7 +2109,7 @@ class AgentActivity(RecognitionHooks):
         stopped_speaking_at = time.time()
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
         if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(*tasks)
+            await utils.aio.cancel_and_wait(*all_tasks)
 
             if audio_output is not None:
                 audio_output.clear_buffer()
@@ -2597,6 +2618,7 @@ class AgentActivity(RecognitionHooks):
         *,
         speech_handle: SpeechHandle,
         model_settings: ModelSettings,
+        tools: list[llm.Tool | llm.Toolset] | None = None,
         user_input: str | None = None,
         instructions: str | None = None,
         tool_reply: bool = False,
@@ -2621,19 +2643,35 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx._upsert_item(msg)
             self._session._conversation_item_added(msg)
 
-        per_response_tool_choice = (
-            self._rt_session.realtime_model.capabilities.per_response_tool_choice
-        )
-        ori_tool_choice = self._tool_choice
-        if utils.is_given(model_settings.tool_choice) and not per_response_tool_choice:
-            self._rt_session.update_options(tool_choice=model_settings.tool_choice)
-
+        ori_tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN
+        ori_tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN
         try:
+            if not (
+                per_response_tool_choice
+                := self._rt_session.realtime_model.capabilities.per_response_tool_choice
+            ):
+                # update the tool and tool choice at the session level if they are specified
+                if (
+                    is_given(model_settings.tool_choice)
+                    and model_settings.tool_choice != self._tool_choice
+                ):
+                    ori_tool_choice = self._tool_choice
+                    self._rt_session.update_options(tool_choice=model_settings.tool_choice)
+
+                if tools is not None:
+                    ori_tools = self._rt_session.tools.flatten()
+                    await self._rt_session.update_tools(llm.ToolContext(tools).flatten())
+
             try:
                 generation_ev = await self._rt_session.generate_reply(
                     instructions=instructions or NOT_GIVEN,
                     tool_choice=(
                         model_settings.tool_choice if per_response_tool_choice else NOT_GIVEN
+                    ),
+                    tools=(
+                        llm.ToolContext(tools).flatten()
+                        if per_response_tool_choice and tools is not None
+                        else NOT_GIVEN
                     ),
                 )
             except llm.RealtimeError as e:
@@ -2653,13 +2691,18 @@ class AgentActivity(RecognitionHooks):
                 instructions=instructions,
             )
         finally:
-            # reset tool_choice value (only needed for non-per-response models)
-            if (
-                not per_response_tool_choice
-                and utils.is_given(model_settings.tool_choice)
-                and model_settings.tool_choice != ori_tool_choice
-            ):
-                self._rt_session.update_options(tool_choice=ori_tool_choice)
+            # reset tool_choice and tools
+            if is_given(ori_tool_choice):
+                try:
+                    self._rt_session.update_options(tool_choice=ori_tool_choice)
+                except Exception:
+                    logger.exception("failed to reset tool_choice")
+
+            if is_given(ori_tools):
+                try:
+                    await self._rt_session.update_tools(ori_tools)
+                except Exception:
+                    logger.exception("failed to reset tools")
 
     @utils.log_exceptions(logger=logger)
     async def _realtime_generation_task(

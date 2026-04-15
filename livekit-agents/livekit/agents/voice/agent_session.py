@@ -25,7 +25,7 @@ from livekit import rtc
 
 from .. import cli, inference, llm, stt, tts, utils, vad
 from .._exceptions import APIError
-from ..job import JobContext, get_job_context
+from ..job import get_job_context
 from ..llm import AgentHandoff, ChatContext, MetricsReport
 from ..llm.chat_context import Instructions
 from ..log import logger
@@ -42,7 +42,7 @@ from ..utils.misc import is_given
 from . import io, room_io
 from ._utils import _set_participant_attributes
 from .agent import Agent, AgentTask
-from .agent_activity import AgentActivity
+from .agent_activity import AgentActivity, _ReusableResources
 from .amd import AMD
 from .events import (
     AgentEvent,
@@ -141,6 +141,7 @@ class AgentSessionOptions:
     tts_text_transforms: Sequence[TextTransforms] | None
     ivr_detection: bool
     aec_warmup_duration: float | None
+    session_close_transcript_timeout: float
 
     @property
     def endpointing(self) -> EndpointingOptions:
@@ -230,6 +231,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         aec_warmup_duration: float | None = 3.0,
         ivr_detection: bool = False,
         user_away_timeout: float | None = 15.0,
+        session_close_transcript_timeout: float = 2.0,
         # Runtime settings
         conn_options: NotGivenOr[SessionConnectOptions] = NOT_GIVEN,
         loop: asyncio.AbstractEventLoop | None = None,
@@ -303,6 +305,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 will ignore user's audio interruptions after the agent starts speaking.
                 This is useful to prevent the agent from being interrupted by echo before AEC is ready.
                 Set to ``None`` to disable. Default ``3.0`` s.
+            session_close_transcript_timeout (float, optional): Seconds to wait for the
+                final STT transcript when closing the session (after audio is detached).
+                Default ``2.0`` s (independent of ``commit_user_turn``'s ``transcript_timeout``).
             min_endpointing_delay (NotGivenOr[float]): Deprecated, use turn_handling=TurnHandlingOptions(...) instead.
             max_endpointing_delay (NotGivenOr[float]): Deprecated, use turn_handling=TurnHandlingOptions(...) instead.
             false_interruption_timeout (NotGivenOr[float | None]): Deprecated, use turn_handling=TurnHandlingOptions(...) instead.
@@ -370,6 +375,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             if is_given(use_tts_aligned_transcript)
             else None,
             aec_warmup_duration=aec_warmup_duration,
+            session_close_transcript_timeout=session_close_transcript_timeout,
         )
         self._conn_options = conn_options or SessionConnectOptions()
         self._started = False
@@ -615,16 +621,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
             # configure observability first
             record_is_given = is_given(record)
-            job_ctx: JobContext | None = None
-            try:
+            job_ctx = get_job_context(required=False)
+            if not is_given(record):
                 # defer to server-side setting for recording
-                job_ctx = get_job_context()
-                if not is_given(record):
-                    record = job_ctx.job.enable_recording
-            except RuntimeError:
-                # JobContext is not available in evals, will not be able to record
-                if not is_given(record):
-                    record = False
+                record = job_ctx.job.enable_recording if job_ctx else False
 
             self._recording_options = _resolve_recording_options(record)  # type: ignore[arg-type]
 
@@ -950,7 +950,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                     and (audio_recognition := activity._audio_recognition) is not None
                 ):
                     # wait for the user transcript to be committed
-                    audio_recognition.commit_user_turn(audio_detached=True, transcript_timeout=2.0)
+                    audio_recognition.commit_user_turn(
+                        audio_detached=True,
+                        transcript_timeout=self._opts.session_close_transcript_timeout,
+                    )
 
                 await activity.aclose()
             self._activity = None
@@ -1221,9 +1224,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         Args:
             transcript_timeout (float, optional): The timeout for the final transcript
                 to be received after committing the user turn.
-                Increase this value if the STT is slow to respond.
+                Default ``2.0`` s. Increase this value if the STT is slow to respond.
             stt_flush_duration (float, optional): The duration of the silence to be appended to the STT
                 to flush the buffer and generate the final transcript.
+                Default ``2.0`` s.
             skip_reply (bool, optional): Whether to skip the reply generation after committing the user turn.
 
         Returns:
@@ -1245,6 +1249,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._agent = agent
 
         if self._started:
+            # immediately block the old activity from accepting new user turns
+            # during the transition window (before drain() formally pauses scheduling)
+            if self._activity is not None:
+                self._activity._new_turns_blocked = True
+
             self._update_activity_atask = task = asyncio.create_task(
                 self._update_activity_task(self._update_activity_atask, self._agent),
                 name="_update_activity_task",
@@ -1292,30 +1301,26 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 # are direct children of the root span, not nested under a tool call.
                 otel_context.attach(self._root_span_context)
 
-            # detach STT pipeline from old activity for potential reuse in the new one
-            _reuse_pipeline = (
-                await self._activity._detach_stt_pipeline_if_reusable(self._next_activity)
-                if self._activity is not None
-                else None
-            )
-
+            reuse_resources: _ReusableResources | None = None
             try:
                 previous_activity_v = self._activity
                 if (activity := self._activity) is not None:
                     if previous_activity == "close":
-                        await activity.drain()
+                        reuse_resources = await activity.drain(new_activity=self._next_activity)
                         await activity.aclose()
                     elif previous_activity == "pause":
-                        await activity.pause(blocked_tasks=blocked_tasks or [])
+                        reuse_resources = await activity.pause(
+                            blocked_tasks=blocked_tasks or [], new_activity=self._next_activity
+                        )
 
                 if self._closing and new_activity == "start":
                     # disallow starting a new activity when the session is closing
                     logger.warning(
                         f"session is closing, skipping {new_activity} activity of {self._next_activity.agent.id}",
                     )
-                    if _reuse_pipeline is not None:
-                        await _reuse_pipeline.aclose()
-                        _reuse_pipeline = None
+                    if reuse_resources is not None:
+                        await reuse_resources.cleanup()
+                        reuse_resources = None
                     self._next_activity = None
                     self._activity = None
                     return
@@ -1338,12 +1343,12 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 self.emit("conversation_item_added", ConversationItemAddedEvent(item=handoff_item))
 
                 if new_activity == "start":
-                    await self._activity.start(reuse_stt_pipeline=_reuse_pipeline)
+                    await self._activity.start(reuse_resources=reuse_resources)
                 elif new_activity == "resume":
-                    await self._activity.resume(reuse_stt_pipeline=_reuse_pipeline)
+                    await self._activity.resume(reuse_resources=reuse_resources)
             except BaseException:
-                if _reuse_pipeline is not None:
-                    await _reuse_pipeline.aclose()
+                if reuse_resources is not None:
+                    await reuse_resources.cleanup()
                 raise
 
         # move it outside the lock to allow calling _update_activity in on_enter of a new agent

@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter
 from typing_extensions import TypedDict
 
 from livekit import rtc
+from livekit.protocol.agent_pb import agent_session as agent_pb
 
 from .. import utils
 from ..log import logger
@@ -287,6 +288,16 @@ class MetricsReport(TypedDict, total=False):
 
     tts_node_ttfb: float
     """Time taken for the `tts_node` to return the first chunk of audio (after the first text token has been sent)
+
+    Assistant `ChatMessage` only
+    """
+
+    playback_latency: float
+    """Delay between forwarding the first audio frame and the `AudioOutput` reporting
+    playback started. Near-zero for the default room output (self-reported when the frame
+    is pushed to the track, so it doesn't account for network delivery to the client);
+    meaningful when a remote avatar worker is in the chain and reports playback via
+    the `lk.playback_started` RPC.
 
     Assistant `ChatMessage` only
     """
@@ -663,8 +674,8 @@ class ChatContext:
 
     @overload
     def to_provider_format(
-        self, format: Literal["mistralai"], *, inject_dummy_user_message: bool = True
-    ) -> tuple[list[dict], Literal[None]]: ...
+        self, format: Literal["mistralai"]
+    ) -> tuple[list[dict], _provider_format.mistralai.MistralFormatData]: ...
 
     @overload
     def to_provider_format(self, format: str, **kwargs: Any) -> tuple[list[dict], Any]: ...
@@ -698,7 +709,7 @@ class ChatContext:
         elif format == "anthropic":
             return _provider_format.anthropic.to_chat_ctx(self, **kwargs)
         elif format == "mistralai":
-            return _provider_format.mistralai.to_chat_ctx(self, **kwargs)
+            return _provider_format.mistralai.to_conversations_ctx(self)
         else:
             raise ValueError(f"Unsupported provider format: {format}")
 
@@ -857,6 +868,11 @@ class ChatContext:
         item_adapter = TypeAdapter(list[ChatItem])
         items = item_adapter.validate_python(data["items"])
         return cls(items)
+
+    def to_proto(self) -> agent_pb.ChatContext:
+        from ..voice.remote_session import _chat_item_to_proto
+
+        return agent_pb.ChatContext(items=[_chat_item_to_proto(item) for item in self.items])
 
     @property
     def readonly(self) -> bool:
